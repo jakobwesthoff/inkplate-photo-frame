@@ -2,6 +2,10 @@
 
 A simple eInk based photo frame using the [Inkplate 6](https://inkplate.io/) from [e-radionica](https://e-radionica.com/en/).
 
+![Photo Frame in Action](https://github.com/jakobwesthoff/inkplate-photo-frame/blob/main/docs/frame1.jpg?raw=true)
+![Photo Frame in Action](https://github.com/jakobwesthoff/inkplate-photo-frame/blob/main/docs/frame2.jpg?raw=true)
+![Photo Frame in Action](https://github.com/jakobwesthoff/inkplate-photo-frame/blob/main/docs/frame3.jpg?raw=true)
+
 ## Usage
 
 1. Clone the repository
