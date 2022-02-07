@@ -1,16 +1,44 @@
+#ifndef TINYPICO_WAVESHARE_EPD
 #include "Inkplate.h"
+#else
+#include <SPI.h>
+#include "Adafruit_ACEP_PSRAM.h"
+#include <TinyPICO.h>
+#endif
+
 #include "SdFat.h"
 #include "EEPROM.h"
 #include "driver/rtc_io.h"
 
-//#define ALWAYS_SHOW_BATTERY
-#define BATTERY_WARNING_LEVEL 4.1
+// Uncomment this line, if you have one of the newer inkplate 10s, which have a
+// different (darker) color spectrum.
+//#define USE_INKPLATE_LIGHTMODE
 
-#define uS_TO_SLEEP 10800000000 //3h
+// #define ALWAYS_SHOW_BATTERY
+#define BATTERY_WARNING_LEVEL 3.7
+
+// #define uS_TO_SLEEP 10800000000 // 3h
 //#define uS_TO_SLEEP 5400000000 //1.5h
 //#define uS_TO_SLEEP 2700000000 //45m
-//#define uS_TO_SLEEP 10000000 //10s
+// #define uS_TO_SLEEP 10000000 // 5s
+#define uS_TO_SLEEP 3600000000 // 1h
 
+#ifdef TINYPICO_WAVESHARE_EPD
+#define EPD_CS 14
+#define EPD_DC 4
+#define EPD_RESET 15
+#define EPD_BUSY 27
+
+#define SD_MISO 22
+#define SD_MOSI 21
+#define SD_CLK 32
+#define SD_CS 5
+
+#define APA_102_PWR 13
+
+#define E_INK_WIDTH 600
+#define E_INK_HEIGHT 448
+#endif
 
 #define MAX_PHOTOS 2048
 #define EEPROM_MAGIC 0
@@ -22,25 +50,47 @@ uint16_t photoCount;
 #define EEPROM_NEXT_PHOTO_INDEX (EEPROM_PHOTO_COUNT + sizeof(photoCount))
 uint16_t nextPhotoIndex;
 
-Inkplate display(INKPLATE_3BIT);
+#ifndef TINYPICO_WAVESHARE_EPD
+static uint8_t displayObjStorage[sizeof(Inkplate)];
+Inkplate *display;
+#else
+static uint8_t displayObjStorage[sizeof(Adafruit_ACEP_PSRAM)];
+SPIClass vspi_class(VSPI);
+SPIClass hspi_class(HSPI);
+Adafruit_ACEP_PSRAM *display;
+SdSpiConfig sdConfig(SD_CS, SHARED_SPI, SPI_HALF_SPEED, &hspi_class);
+SdFat sd;
+TinyPICO tp = TinyPICO();
+#endif
+
 SdFile file;
 SdFile dir;
 
-void checkBattery() {
-  double batteryLevel = display.readBattery();
+void checkBattery()
+{
+#ifndef TINYPICO_WAVESHARE_EPD
+  double batteryLevel = display->readBattery();
+#else
+  float batteryLevel = tp.GetBatteryVoltage();
+#endif
   Serial.print("Battery level: ");
   Serial.println(batteryLevel);
-  #ifndef ALWAYS_SHOW_BATTERY
-  if (batteryLevel < BATTERY_WARNING_LEVEL) {
-  #endif
-    display.setTextColor(7, 0);
-    display.setCursor(0,574);
-    display.print("Battery level low! (");
-    display.print(batteryLevel);
-    display.println(")");
-  #ifndef ALWAYS_SHOW_BATTERY
+#ifndef ALWAYS_SHOW_BATTERY
+  if (batteryLevel < BATTERY_WARNING_LEVEL)
+  {
+#endif
+#ifndef TINYPICO_WAVESHARE_EPD
+    display->setTextColor(7, 0);
+#else
+  display->setTextColor(ACEP_COLOR_WHITE, ACEP_COLOR_BLACK);
+#endif
+    display->setCursor(0, E_INK_HEIGHT - 26);
+    display->print("Battery level low! (");
+    display->print(batteryLevel);
+    display->println(")");
+#ifndef ALWAYS_SHOW_BATTERY
   }
-  #endif
+#endif
 }
 
 void gotoSleep()
@@ -48,9 +98,13 @@ void gotoSleep()
   Serial.println("Waiting 2.5s for everything to settle...");
   delay(2500);
   Serial.println("Going to sleep");
-  rtc_gpio_isolate(GPIO_NUM_12);              //Isolate/disable GPIO12 on ESP32 (only to reduce power consumption in sleep)
-  esp_sleep_enable_timer_wakeup(uS_TO_SLEEP); //Activate wake-up timer
-  esp_deep_sleep_start();                     //Put ESP32 into deep sleep. Program stops here.
+
+#ifndef TINYPICO_WAVESHARE_EPD
+  rtc_gpio_isolate(GPIO_NUM_12);
+#endif
+  // Isolate/disable GPIO12 on ESP32 (only to reduce power consumption in sleep)
+  esp_sleep_enable_timer_wakeup(uS_TO_SLEEP); // Activate wake-up timer
+  esp_deep_sleep_start();                     // Put ESP32 into deep sleep. Program stops here.
 }
 
 void buildIndex()
@@ -73,7 +127,11 @@ void buildIndex()
 
     Serial.print(file.dirIndex());
     Serial.print(", ");
+#ifndef TINYPICO_WAVESHARE_EPD
     file.printName();
+#else
+    file.printName(&Serial);
+#endif
     Serial.println();
 
     if (file.isDir())
@@ -93,7 +151,8 @@ void buildIndex()
     photoIndexList[photoCount++] = file.dirIndex();
     file.close();
 
-    if (photoCount >= MAX_PHOTOS) {
+    if (photoCount >= MAX_PHOTOS)
+    {
       Serial.print("Max photo count of ");
       Serial.print(MAX_PHOTOS);
       Serial.println(" reached. Stopping scan.");
@@ -119,7 +178,6 @@ void shuffleIndex()
 {
   shuffleArray(photoIndexList, photoCount);
 }
-
 
 void invalidateEEPROM()
 {
@@ -148,11 +206,11 @@ void initEEPROM()
 {
   char magic[20];
 
-  if (!EEPROM.begin(MAX_PHOTOS*2 /*photoIndexList*/ + 2 /*photoIndexCount*/ + 2 /*nextPhotoIndex*/ + 20 /*eepromMagic*/))
+  if (!EEPROM.begin(MAX_PHOTOS * 2 /*photoIndexList*/ + 2 /*photoIndexCount*/ + 2 /*nextPhotoIndex*/ + 20 /*eepromMagic*/))
   {
-    display.println("EEPROM initialization error!");
+    display->println("EEPROM initialization error!");
     Serial.println("EEPROM initialization error!");
-    display.display();
+    display->display();
     gotoSleep();
   }
 
@@ -168,11 +226,24 @@ void initEEPROM()
 
 void initSd()
 {
-  if (!display.sdCardInit())
+  uint8_t retries = 5;
+  uint8_t retry_delay = 100;
+#ifndef TINYPICO_WAVESHARE_EPD
+  while (!display->sdCardInit() && retries > 0)
   {
-    display.println("SD initialization error!");
+#else
+  while (!sd.begin(sdConfig) && retries > 0)
+  {
+#endif
+    Serial.println("SD initialization error, retrying!");
+    --retries;
+    delay(retry_delay);
+  }
+  if (retries == 0)
+  {
+    display->println("SD initialization error!");
     Serial.println("SD initialization error!");
-    display.display();
+    display->display();
     invalidateEEPROM();
     gotoSleep();
     return;
@@ -187,9 +258,9 @@ void openPhotoDirectory()
 {
   if (dir.open("/photos") == 0)
   {
-    display.println("Could not open 'photos' folder.");
+    display->println("Could not open 'photos' folder.");
     Serial.println("Could not open 'photos' folder.");
-    display.display();
+    display->display();
     invalidateEEPROM();
     gotoSleep();
     return;
@@ -200,10 +271,9 @@ void openPhotoDirectory()
   }
 }
 
-
 void readAndDisplayPhoto()
 {
-  const uint16_t width = 800 / 2;
+  const uint16_t width = E_INK_WIDTH / 2;
   // const uint16_t height = 600;
 
   uint32_t offset = 0;
@@ -216,8 +286,8 @@ void readAndDisplayPhoto()
   if (!file.open(&dir, photoIndexList[nextPhotoIndex], O_RDONLY))
   {
     Serial.println("Could not open picture file.");
-    display.println("Could not open picture file.");
-    display.display();
+    display->println("Could not open picture file.");
+    display->display();
     invalidateEEPROM();
     gotoSleep();
     return;
@@ -231,8 +301,13 @@ void readAndDisplayPhoto()
     {
       y = (offset + i) / width;
       x = ((offset + i) % width) * 2;
-      display.drawPixel(x, y, (buffer[i] >> 4) >> 1);
-      display.drawPixel(x + 1, y, (buffer[i] & 0x0f) >> 1);
+#ifndef TINYPICO_WAVESHARE_EPD
+      display->drawPixel(x, y, (buffer[i] >> 4) >> 1);
+      display->drawPixel(x + 1, y, (buffer[i] & 0x0f) >> 1);
+#else
+      display->writePixel(x, y, buffer[i] >> 4 & 0x0f);
+      display->writePixel(x + 1, y, buffer[i] & 0x0f);
+#endif
     }
     offset += nBytes;
     total += nBytes;
@@ -246,11 +321,36 @@ void readAndDisplayPhoto()
 void setup()
 {
   Serial.begin(115200);
+  while (!Serial)
+  {
+    delay(1);
+  }
 
-  display.begin();
-  display.setTextSize(3);
-  display.setTextColor(0, 7);
-  display.setTextWrap(true);
+#ifndef TINYPICO_WAVESHARE_EPD
+  display = new (displayObjStorage) Inkplate(INKPLATE_3BIT);
+#ifdef USE_INKPLATE_LIGHTMODE
+  display->begin(true);
+#else
+  display->begin();
+#endif
+  display->setTextSize(3);
+  display->setTextColor(0, 7);
+  display->setTextWrap(true);
+#else
+  // Spi for sdcard
+  hspi_class.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+
+  // Disable APA102
+  pinMode(APA_102_PWR, OUTPUT);
+  digitalWrite(APA_102_PWR, 0);
+
+  display = new (displayObjStorage) Adafruit_ACEP_PSRAM(E_INK_WIDTH, E_INK_HEIGHT, EPD_DC, EPD_RESET, EPD_CS, EPD_BUSY, &vspi_class);
+  display->begin();
+  display->clearBuffer();
+  display->setTextSize(3);
+  display->setTextColor(ACEP_COLOR_BLACK, ACEP_COLOR_WHITE);
+  display->setTextWrap(true);
+#endif
 
   initSd();
   openPhotoDirectory();
@@ -271,11 +371,12 @@ void setup()
   }
   updateEEPROM();
   checkBattery();
-  display.display();
+
+  display->display();
   gotoSleep();
 }
 
 void loop()
 {
-  //Nothing here due to deep sleep.
+  // Nothing here due to deep sleep.
 }
