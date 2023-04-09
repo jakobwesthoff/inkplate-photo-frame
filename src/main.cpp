@@ -1,5 +1,6 @@
-#ifndef TINYPICO_WAVESHARE_EPD
+#if defined(ARDUINO_INKPLATE10) || defined(ARDUINO_INKPLATE) || defined(ARDUINO_INKPLATECOLOR)
 #include "Inkplate.h"
+#include "inkplate_battery.h"
 #else
 #include <SPI.h>
 #include "Adafruit_ACEP_PSRAM.h"
@@ -7,21 +8,20 @@
 #endif
 
 #include "SdFat.h"
-#include "EEPROM.h"
 #include "driver/rtc_io.h"
 
 // Uncomment this line, if you have one of the newer inkplate 10s, which have a
 // different (darker) color spectrum.
-//#define USE_INKPLATE_LIGHTMODE
+// #define USE_INKPLATE_LIGHTMODE
 
 // #define ALWAYS_SHOW_BATTERY
 #define BATTERY_WARNING_LEVEL 3.6
 
 // #define uS_TO_SLEEP 10800000000 // 3h
-//#define uS_TO_SLEEP 5400000000 //1.5h
-//#define uS_TO_SLEEP 2700000000 //45m
+// #define uS_TO_SLEEP 5400000000 //1.5h
+// #define uS_TO_SLEEP 2700000000 //45m
 // #define uS_TO_SLEEP 10000000 // 5s
-#define uS_TO_SLEEP 3600000000 // 1h
+#define uS_TO_SLEEP 15 * 60 * 1000 * 1000
 
 #ifdef TINYPICO_WAVESHARE_EPD
 #define EPD_CS 14
@@ -40,15 +40,15 @@
 #define E_INK_HEIGHT 448
 #endif
 
-#define MAX_PHOTOS 2048
-#define EEPROM_MAGIC 0
-const char eepromMagic[20] = "INKPLATE PHOTOFRAME";
-#define EEPROM_PHOTO_INDEX_LIST sizeof(eepromMagic)
-uint16_t photoIndexList[MAX_PHOTOS];
-#define EEPROM_PHOTO_COUNT (EEPROM_PHOTO_INDEX_LIST + sizeof(photoIndexList))
-uint16_t photoCount;
-#define EEPROM_NEXT_PHOTO_INDEX (EEPROM_PHOTO_COUNT + sizeof(photoCount))
-uint16_t nextPhotoIndex;
+#define MAX_PHOTOS 32767
+const char config_magic[20] = "INKPLATE PHOTOFRAME";
+#define CONFIG_MAGIC_LEN sizeof(config_magic)
+uint16_t photo_index_list[MAX_PHOTOS];
+#define CONFIG_PHOTO_INDEX_LEN sizeof(photo_index_list)
+uint16_t photo_count;
+#define CONFIG_PHOTO_COUNT_LEN sizeof(photo_count)
+uint16_t next_photo_index;
+#define CONFIG_NEXT_PHOTO_INDEX_LEN sizeof(next_photo_index)
 
 #ifndef TINYPICO_WAVESHARE_EPD
 static uint8_t displayObjStorage[sizeof(Inkplate)];
@@ -65,16 +65,16 @@ TinyPICO tp = TinyPICO();
 
 SdFile file;
 SdFile dir;
+SdFile config;
 
-void checkBattery()
+void check_battery()
 {
 #ifndef TINYPICO_WAVESHARE_EPD
-  double batteryLevel = display->readBattery();
+  double batteryLevel = readInkplateBattery(display);
 #else
   float batteryLevel = tp.GetBatteryVoltage();
 #endif
-  Serial.print("Battery level: ");
-  Serial.println(batteryLevel);
+  log_d("Battery level: %lf", batteryLevel);
 #ifndef ALWAYS_SHOW_BATTERY
   if (batteryLevel < BATTERY_WARNING_LEVEL)
   {
@@ -93,13 +93,12 @@ void checkBattery()
 #endif
 }
 
-void gotoSleep()
+void goto_sleep(uint64_t micro_seconds)
 {
-  Serial.println("Waiting 2.5s for everything to settle...");
-  delay(2500);
-  Serial.println("Going to sleep");
+  log_d("Going to sleep");
 
 #ifndef TINYPICO_WAVESHARE_EPD
+  // Isolate/disable GPIO12 on ESP32 (only to reduce power consumption in sleep)
   rtc_gpio_isolate(GPIO_NUM_12);
 #endif
   // Isolate/disable GPIO12 on ESP32 (only to reduce power consumption in sleep)
@@ -107,61 +106,81 @@ void gotoSleep()
   esp_deep_sleep_start();                     // Put ESP32 into deep sleep. Program stops here.
 }
 
-void buildIndex()
+void log_wakeup_reason()
 {
-  nextPhotoIndex = 0;
-  photoCount = 0;
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch (wakeup_reason)
+  {
+  case ESP_SLEEP_WAKEUP_EXT0:
+    log_d("Wakeup caused by external signal using RTC_IO");
+    break;
+  case ESP_SLEEP_WAKEUP_EXT1:
+    log_d("Wakeup caused by external signal using RTC_CNTL");
+    break;
+  case ESP_SLEEP_WAKEUP_TIMER:
+    log_d("Wakeup caused by timer");
+    break;
+  case ESP_SLEEP_WAKEUP_TOUCHPAD:
+    log_d("Wakeup caused by touchpad");
+    break;
+  case ESP_SLEEP_WAKEUP_ULP:
+    log_d("Wakeup caused by ULP program");
+    break;
+  default:
+    log_d("Wakeup was not caused by deep sleep");
+    break;
+  }
+}
+
+void build_index()
+{
+  log_d("Rebuilding index...");
+
+  next_photo_index = 0;
+  photo_count = 0;
 
   dir.rewind();
   while (true)
   {
-    Serial.print("Scanning file: ");
     if (!file.openNext(&dir, O_RDONLY))
     {
-      Serial.println("End reached!");
-      Serial.print("Scanned ");
-      Serial.print(photoCount);
-      Serial.println(" photos");
+      log_d("End reached!");
+      log_d("Scanned %d photos", photo_count);
       return;
     }
 
-    Serial.print(file.dirIndex());
-    Serial.print(", ");
-#ifndef TINYPICO_WAVESHARE_EPD
-    file.printName();
-#else
-    file.printName(&Serial);
-#endif
-    Serial.println();
+    if (photo_count % 100 == 0)
+    {
+      log_d("Scanning file %d: %d", photo_count, file.dirIndex());
+    }
 
     if (file.isDir())
     {
-      Serial.println("Found directory. Skipping.");
+      log_d("Found directory. Skipping.");
       file.close();
       continue;
     }
 
     if (file.isHidden())
     {
-      Serial.println("Found hidden file. Skipping.");
+      log_d("Found hidden file. Skipping.");
       file.close();
       continue;
     }
 
-    photoIndexList[photoCount++] = file.dirIndex();
+    photo_index_list[photo_count++] = file.dirIndex();
     file.close();
 
-    if (photoCount >= MAX_PHOTOS)
+    if (photo_count >= MAX_PHOTOS)
     {
-      Serial.print("Max photo count of ");
-      Serial.print(MAX_PHOTOS);
-      Serial.println(" reached. Stopping scan.");
+      log_d("Max photo count of %d reached. Stopping scan.", MAX_PHOTOS);
       break;
     }
   }
 }
 
-void shuffleArray(uint16_t *array, uint16_t size)
+void shuffle_array(uint16_t *array, uint16_t size)
 {
   uint16_t last = 0;
   uint16_t temp = array[last];
@@ -174,57 +193,75 @@ void shuffleArray(uint16_t *array, uint16_t size)
   array[last] = temp;
 }
 
-void shuffleIndex()
+void shuffle_index()
 {
-  shuffleArray(photoIndexList, photoCount);
+  log_d("Shuffle index...");
+  shuffle_array(photo_index_list, photo_count);
 }
 
-void invalidateEEPROM()
+void invalidate_config()
 {
-  EEPROM.put(EEPROM_MAGIC, "INVALID");
-  EEPROM.commit();
+  config.truncate(0);
+  config.rewind();
+  config.flush();
 }
 
-void updateEEPROM()
+void update_config()
 {
-  EEPROM.put(EEPROM_MAGIC, eepromMagic);
-  EEPROM.put(EEPROM_PHOTO_INDEX_LIST, photoIndexList);
-  EEPROM.put(EEPROM_PHOTO_COUNT, photoCount);
-  EEPROM.put(EEPROM_NEXT_PHOTO_INDEX, nextPhotoIndex);
-  EEPROM.commit();
+  log_d("Updating config...");
+  invalidate_config();
+  config.write(config_magic, CONFIG_MAGIC_LEN);
+  config.write(photo_index_list, CONFIG_PHOTO_INDEX_LEN);
+  config.write(&photo_count, CONFIG_PHOTO_COUNT_LEN);
+  config.write(&next_photo_index, CONFIG_NEXT_PHOTO_INDEX_LEN);
+  config.flush();
 }
 
-void readEEPROM()
+void read_config()
 {
-  Serial.println("Reading EEPROM...");
-  EEPROM.get(EEPROM_PHOTO_INDEX_LIST, photoIndexList);
-  EEPROM.get(EEPROM_PHOTO_COUNT, photoCount);
-  EEPROM.get(EEPROM_NEXT_PHOTO_INDEX, nextPhotoIndex);
+  char magic[CONFIG_MAGIC_LEN];
+
+  log_d("Reading config...");
+  config.rewind();
+  config.read(magic, CONFIG_MAGIC_LEN);
+  config.read(photo_index_list, CONFIG_PHOTO_INDEX_LEN);
+  config.read(&photo_count, CONFIG_PHOTO_COUNT_LEN);
+  config.read(&next_photo_index, CONFIG_NEXT_PHOTO_INDEX_LEN);
 }
 
-void initEEPROM()
-{
-  char magic[20];
-
-  if (!EEPROM.begin(MAX_PHOTOS * 2 /*photoIndexList*/ + 2 /*photoIndexCount*/ + 2 /*nextPhotoIndex*/ + 20 /*eepromMagic*/))
+void open_config() {
+  if (config.open("/config.bin", FILE_WRITE) == 0)
   {
-    display->println("EEPROM initialization error!");
-    Serial.println("EEPROM initialization error!");
+    display->println("Could not open '/config.bin'.");
+    log_d("Could not open '/config.bin' folder.");
     display->display();
-    gotoSleep();
+    goto_sleep(uS_TO_SLEEP);
+    return;
   }
-
-  EEPROM.get(EEPROM_MAGIC, magic);
-  if (strncmp(magic, eepromMagic, 20) != 0)
+  else
   {
-    Serial.println("No valid config found formatting EEPROM.");
-    buildIndex();
-    shuffleIndex();
-    updateEEPROM();
+    log_d("/config.bin opened.");
+  }
+  config.rewind();
+}
+
+void init_config()
+{
+  char magic[CONFIG_MAGIC_LEN];
+
+  open_config();
+
+  config.read(magic, CONFIG_MAGIC_LEN);
+  if (strncmp(magic, config_magic, 20) != 0)
+  {
+    log_d("No valid config found reinitializing it.");
+    build_index();
+    shuffle_index();
+    update_config();
   }
 }
 
-void initSd()
+void init_sd()
 {
   uint8_t retries = 5;
   uint8_t retry_delay = 100;
@@ -235,86 +272,87 @@ void initSd()
   while (!sd.begin(sdConfig) && retries > 0)
   {
 #endif
-    Serial.println("SD initialization error, retrying!");
+    log_d("SD initialization error, retrying!");
     --retries;
     delay(retry_delay);
   }
   if (retries == 0)
   {
     display->println("SD initialization error!");
-    Serial.println("SD initialization error!");
+    log_d("SD initialization error!");
     display->display();
-    invalidateEEPROM();
-    gotoSleep();
+    goto_sleep(uS_TO_SLEEP);
     return;
   }
   else
   {
-    Serial.println("SD Initialized.");
+    log_d("SD Initialized.");
   }
 }
 
-void openPhotoDirectory()
+void open_photo_directory()
 {
   if (dir.open("/photos") == 0)
   {
     display->println("Could not open 'photos' folder.");
-    Serial.println("Could not open 'photos' folder.");
+    log_d("Could not open 'photos' folder.");
     display->display();
-    invalidateEEPROM();
-    gotoSleep();
+    invalidate_config();
+    goto_sleep(uS_TO_SLEEP);
     return;
   }
   else
   {
-    Serial.println("Directory opened.");
+    log_d("Directory opened.");
   }
 }
 
-void readAndDisplayPhoto()
+void read_and_display_photo()
 {
   const uint16_t width = E_INK_WIDTH / 2;
   // const uint16_t height = 600;
 
   uint32_t offset = 0;
-  uint16_t nBytes;
+  uint16_t n_bytes;
   uint8_t buffer[1024];
   uint16_t x, y;
   uint16_t i;
   uint32_t total = 0;
 
-  if (!file.open(&dir, photoIndexList[nextPhotoIndex], O_RDONLY))
+  if (!file.open(&dir, photo_index_list[next_photo_index], O_RDONLY))
   {
-    Serial.println("Could not open picture file.");
+    log_d("Could not open picture file.");
     display->println("Could not open picture file.");
     display->display();
-    invalidateEEPROM();
-    gotoSleep();
+    invalidate_config();
+    goto_sleep(uS_TO_SLEEP);
     return;
   }
 
   memset(&buffer, 0, 1024);
-  nBytes = file.read(&buffer, 1024);
-  while (nBytes > 0)
+  n_bytes = file.read(&buffer, 1024);
+  while (n_bytes > 0)
   {
-    for (i = 0; i < nBytes; i++)
+    for (i = 0; i < n_bytes; i++)
     {
       y = (offset + i) / width;
       x = ((offset + i) % width) * 2;
-#ifndef TINYPICO_WAVESHARE_EPD
-      display->drawPixel(x, y, (buffer[i] >> 4) >> 1);
-      display->drawPixel(x + 1, y, (buffer[i] & 0x0f) >> 1);
-#else
+#ifdef TINYPICO_WAVESHARE_EPD
       display->writePixel(x, y, buffer[i] >> 4 & 0x0f);
       display->writePixel(x + 1, y, buffer[i] & 0x0f);
+#elif ARDUINO_INKPLATECOLOR
+      display->drawPixel(x, y, (buffer[i] >> 4));
+      display->drawPixel(x + 1, y, (buffer[i] & 0x0f));
+#else
+      display->drawPixel(x, y, (buffer[i] >> 4) >> 1);
+      display->drawPixel(x + 1, y, (buffer[i] & 0x0f) >> 1);
 #endif
     }
-    offset += nBytes;
-    total += nBytes;
-    nBytes = file.read(&buffer, 1024);
+    offset += n_bytes;
+    total += n_bytes;
+    n_bytes = file.read(&buffer, 1024);
   }
-  Serial.print("Read image bytes: ");
-  Serial.println(total);
+  log_d("Read image bytes: %d", total);
   file.close();
 }
 
@@ -326,9 +364,15 @@ void setup()
     delay(1);
   }
 
+  log_wakeup_reason();
+
 #ifndef TINYPICO_WAVESHARE_EPD
+#ifndef ARDUINO_INKPLATECOLOR
   display = new (displayObjStorage) Inkplate(INKPLATE_3BIT);
-#ifdef USE_INKPLATE_LIGHTMODE
+#else
+  display = new (displayObjStorage) Inkplate();
+#endif
+#if defined(USE_INKPLATE_LIGHTMODE) && !defined(ARDUINO_INKPLATE_COLOR)
   display->begin(true);
 #else
   display->begin();
@@ -352,28 +396,28 @@ void setup()
   display->setTextWrap(true);
 #endif
 
-  initSd();
-  openPhotoDirectory();
-  initEEPROM();
-  readEEPROM();
+  init_sd();
+  open_photo_directory();
+  init_config();
+  read_config();
 
-  readAndDisplayPhoto();
-  if (nextPhotoIndex >= photoCount - 1)
+  read_and_display_photo();
+  if (next_photo_index >= photo_count - 1)
   {
     // Reshuffle and reset for next run needed
-    Serial.println("End of Photos reached. Reindexing and Reshuffling...");
-    buildIndex();
-    shuffleIndex();
+    log_d("End of Photos reached. Reindexing and Reshuffling...");
+    build_index();
+    shuffle_index();
   }
   else
   {
-    ++nextPhotoIndex;
+    ++next_photo_index;
   }
-  updateEEPROM();
-  checkBattery();
+  update_config();
+  check_battery();
 
   display->display();
-  gotoSleep();
+  goto_sleep(uS_TO_SLEEP);
 }
 
 void loop()

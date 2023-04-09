@@ -1,3 +1,4 @@
+#ifdef TINYPICO_WAVESHARE_EPD
 #include "Adafruit_ACEP_PSRAM.h"
 
 #define BUSY_WAIT 500
@@ -382,3 +383,4 @@ void Adafruit_ACEP_PSRAM::setRAMAddress(uint16_t x, uint16_t y)
   (void)x;
   (void)y;
 }
+#endif
