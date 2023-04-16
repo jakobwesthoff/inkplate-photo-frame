@@ -40,15 +40,30 @@
 #define E_INK_HEIGHT 448
 #endif
 
+typedef struct photo_index
+{
+  uint16_t dir_index;
+  uint16_t file_index;
+} photo_index_t;
+
 #define MAX_PHOTOS 32767
 const char config_magic[20] = "INKPLATE PHOTOFRAME";
 #define CONFIG_MAGIC_LEN sizeof(config_magic)
-uint16_t photo_index_list[MAX_PHOTOS];
-#define CONFIG_PHOTO_INDEX_LEN sizeof(photo_index_list)
+// Allocated in psram
+photo_index_t *photo_index_list;
+#define CONFIG_PHOTO_INDEX_LEN (sizeof(photo_index_t) * MAX_PHOTOS)
 uint16_t photo_count;
 #define CONFIG_PHOTO_COUNT_LEN sizeof(photo_count)
 uint16_t next_photo_index;
 #define CONFIG_NEXT_PHOTO_INDEX_LEN sizeof(next_photo_index)
+
+#define HARD_ERROR(x) { \
+    display->println(x); \
+    log_d(x); \
+    display->display(); \
+    goto_sleep(uS_TO_SLEEP); \
+    return; \
+}
 
 #ifndef TINYPICO_WAVESHARE_EPD
 static uint8_t displayObjStorage[sizeof(Inkplate)];
@@ -63,8 +78,7 @@ SdFat sd;
 TinyPICO tp = TinyPICO();
 #endif
 
-SdFile file;
-SdFile dir;
+SdFile photos_dir;
 SdFile config;
 
 void check_battery()
@@ -133,31 +147,26 @@ void log_wakeup_reason()
   }
 }
 
-void build_index()
+void build_index_for_dir(SdFile *dir)
 {
-  log_d("Rebuilding index...");
+  char dirname[256];
+  SdFile file;
 
-  next_photo_index = 0;
-  photo_count = 0;
+  dir->getName(dirname, sizeof(dirname));
+  log_d("Rebuilding index for %s", dirname);
 
-  dir.rewind();
+  dir->rewind();
   while (true)
   {
-    if (!file.openNext(&dir, O_RDONLY))
+    if (!file.openNext(dir, O_RDONLY))
     {
-      log_d("End reached!");
-      log_d("Scanned %d photos", photo_count);
+      log_d("End reached of %s", dirname);
       return;
-    }
-
-    if (photo_count % 100 == 0)
-    {
-      log_d("Scanning file %d: %d", photo_count, file.dirIndex());
     }
 
     if (file.isDir())
     {
-      log_d("Found directory. Skipping.");
+      log_d("Found sub/sub directory. Skipping.");
       file.close();
       continue;
     }
@@ -169,21 +178,60 @@ void build_index()
       continue;
     }
 
-    photo_index_list[photo_count++] = file.dirIndex();
+    photo_index_list[photo_count++] = {.dir_index = dir->dirIndex(), .file_index = file.dirIndex()};
     file.close();
 
     if (photo_count >= MAX_PHOTOS)
     {
       log_d("Max photo count of %d reached. Stopping scan.", MAX_PHOTOS);
-      break;
+      return;
     }
   }
 }
 
-void shuffle_array(uint16_t *array, uint16_t size)
+void build_index()
 {
+  next_photo_index = 0;
+  photo_count = 0;
+
+  SdFile file;
+  log_d("Rebuilding /photos index");
+
+  photos_dir.rewind();
+  while (true)
+  {
+    if (!file.openNext(&photos_dir, O_RDONLY))
+    {
+      log_d("End reached of /photos");
+      return;
+    }
+
+    if (!file.isDir())
+    {
+      log_d("Found non directory in /photos. Skipping.");
+      file.close();
+      continue;
+    }
+
+    build_index_for_dir(&file);
+    file.close();
+
+    if (photo_count >= MAX_PHOTOS)
+    {
+      break;
+    }
+  }
+
+  log_d("Finished rebuilding. Scanned %d photos", photo_count);
+}
+
+void shuffle_array(photo_index_t *array, uint16_t size)
+{
+  // Initialize randomseed using internal random generation of esp32
+  randomSeed(analogRead(0));
+
   uint16_t last = 0;
-  uint16_t temp = array[last];
+  photo_index_t temp = array[last];
   for (uint16_t i = 0; i < size; i++)
   {
     uint16_t index = random(0, size);
@@ -199,22 +247,56 @@ void shuffle_index()
   shuffle_array(photo_index_list, photo_count);
 }
 
-void invalidate_config()
+void open_config()
 {
-  config.truncate(0);
+  if (config.open("/config.bin", FILE_WRITE) == 0)
+  {
+    HARD_ERROR("Could not open '/config.bin'")
+  }
+  else
+  {
+    log_d("/config.bin opened.");
+  }
   config.rewind();
-  config.flush();
+}
+
+void open_config_tmp(SdFile *config)
+{
+  if (config->open("/~config.bin", FILE_WRITE) == 0)
+  {
+    HARD_ERROR("Could not open '/~config.bin'")
+  }
+  else
+  {
+    log_d("/~config.bin opened.");
+  }
 }
 
 void update_config()
 {
+  SdFile new_config;
+
   log_d("Updating config...");
-  invalidate_config();
-  config.write(config_magic, CONFIG_MAGIC_LEN);
-  config.write(photo_index_list, CONFIG_PHOTO_INDEX_LEN);
-  config.write(&photo_count, CONFIG_PHOTO_COUNT_LEN);
-  config.write(&next_photo_index, CONFIG_NEXT_PHOTO_INDEX_LEN);
-  config.flush();
+  open_config_tmp(&new_config);
+  new_config.truncate(0);
+  new_config.rewind();
+  new_config.write(config_magic, CONFIG_MAGIC_LEN);
+  new_config.write(photo_index_list, CONFIG_PHOTO_INDEX_LEN);
+  new_config.write(&photo_count, CONFIG_PHOTO_COUNT_LEN);
+  new_config.write(&next_photo_index, CONFIG_NEXT_PHOTO_INDEX_LEN);
+  new_config.flush();
+  log_d("New config written.");
+  if (config.remove() == false) {
+    HARD_ERROR("Could not remove old config file for update")
+  };
+  config.close();
+
+  if (new_config.rename("/config.bin") == false) {
+    HARD_ERROR("Could not replace new config with old one")
+  }
+  new_config.close();
+  open_config();
+  log_d("config update complete");
 }
 
 void read_config()
@@ -227,22 +309,6 @@ void read_config()
   config.read(photo_index_list, CONFIG_PHOTO_INDEX_LEN);
   config.read(&photo_count, CONFIG_PHOTO_COUNT_LEN);
   config.read(&next_photo_index, CONFIG_NEXT_PHOTO_INDEX_LEN);
-}
-
-void open_config() {
-  if (config.open("/config.bin", FILE_WRITE) == 0)
-  {
-    display->println("Could not open '/config.bin'.");
-    log_d("Could not open '/config.bin' folder.");
-    display->display();
-    goto_sleep(uS_TO_SLEEP);
-    return;
-  }
-  else
-  {
-    log_d("/config.bin opened.");
-  }
-  config.rewind();
 }
 
 void init_config()
@@ -278,11 +344,7 @@ void init_sd()
   }
   if (retries == 0)
   {
-    display->println("SD initialization error!");
-    log_d("SD initialization error!");
-    display->display();
-    goto_sleep(uS_TO_SLEEP);
-    return;
+    HARD_ERROR("SD initialization error!")
   }
   else
   {
@@ -292,14 +354,9 @@ void init_sd()
 
 void open_photo_directory()
 {
-  if (dir.open("/photos") == 0)
+  if (photos_dir.open("/photos") == 0)
   {
-    display->println("Could not open 'photos' folder.");
-    log_d("Could not open 'photos' folder.");
-    display->display();
-    invalidate_config();
-    goto_sleep(uS_TO_SLEEP);
-    return;
+    HARD_ERROR("Could not open 'photos' folder.")
   }
   else
   {
@@ -309,6 +366,8 @@ void open_photo_directory()
 
 void read_and_display_photo()
 {
+  SdFile dir;
+  SdFile file;
   const uint16_t width = E_INK_WIDTH / 2;
   // const uint16_t height = 600;
 
@@ -319,14 +378,43 @@ void read_and_display_photo()
   uint16_t i;
   uint32_t total = 0;
 
-  if (!file.open(&dir, photo_index_list[next_photo_index], O_RDONLY))
+  // for (uint16_t photo_idx = 0; photo_idx < photo_count; photo_idx++)
+  // {
+  //   uint16_t dir_index = (photo_index_list[photo_idx] & 0xffff0000) >> 16;
+  //   uint16_t file_index = (photo_index_list[photo_idx] & 0x0000ffff);
+  //   log_d("Opening id : [%d] %d, %d", photo_idx, dir_index, file_index);
+
+  //   if (dir.open(&photos_dir, dir_index, 0) == 0)
+  //   {
+  //     log_d("Could not open picture file directory.");
+  //     display->println("Could not open picture file directory.");
+  //     display->display();
+  //     invalidate_config();
+  //     goto_sleep(uS_TO_SLEEP);
+  //     return;
+  //   }
+
+  //   if (!file.open(&dir, file_index, O_RDONLY))
+  //   {
+  //     log_d("Id [%d] %d %d could not be opened!", photo_idx, dir_index, file_index);
+  //   }
+  //   else
+  //   {
+  //     file.close();
+  //   }
+  //   dir.close();
+  // }
+
+  photo_index_t photo_index = photo_index_list[next_photo_index];
+
+  if (dir.open(&photos_dir, photo_index.dir_index, 0) == 0)
   {
-    log_d("Could not open picture file.");
-    display->println("Could not open picture file.");
-    display->display();
-    invalidate_config();
-    goto_sleep(uS_TO_SLEEP);
-    return;
+    HARD_ERROR("Could not open picture file directory.")
+  }
+
+  if (!file.open(&dir, photo_index.file_index, O_RDONLY))
+  {
+    HARD_ERROR("Could not open picture file.");
   }
 
   memset(&buffer, 0, 1024);
@@ -354,6 +442,7 @@ void read_and_display_photo()
   }
   log_d("Read image bytes: %d", total);
   file.close();
+  dir.close();
 }
 
 void setup()
@@ -395,6 +484,18 @@ void setup()
   display->setTextColor(ACEP_COLOR_BLACK, ACEP_COLOR_WHITE);
   display->setTextWrap(true);
 #endif
+  // Check PSRAM is working
+  log_d("Total heap: %d", ESP.getHeapSize());
+  log_d("Free heap: %d", ESP.getFreeHeap());
+  log_d("Total PSRAM: %d", ESP.getPsramSize());
+  log_d("Free PSRAM: %d", ESP.getFreePsram());
+
+  // Allocate psram buffer for photoindex;
+  photo_index_list = (photo_index_t *)ps_malloc(CONFIG_PHOTO_INDEX_LEN);
+  if (photo_index_list == nullptr)
+  {
+    HARD_ERROR("Allocation of photo_index memory failed!");
+  }
 
   init_sd();
   open_photo_directory();
